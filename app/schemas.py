@@ -65,19 +65,23 @@ class ImportJobResponse(BaseModel):
 
 class QueueStats(BaseModel):
     waiting: int
-    delayed: int
-    processing: int
-    dead: int
+    in_flight: int
+    active: int
+    scheduled: int
 
 
 class WorkerStats(BaseModel):
     alive: int
-    ids: list[str]
+    names: list[str]
 
 
 class ImportStats(BaseModel):
     total: int
     by_status: dict[str, int]
+
+
+class EmailStats(BaseModel):
+    failed: int
 
 
 class DurationStats(BaseModel):
@@ -90,26 +94,8 @@ class StatsResponse(BaseModel):
     queue: QueueStats
     workers: WorkerStats
     imports: ImportStats
+    emails: EmailStats
     durations: DurationStats
-
-
-class DeadJobResponse(BaseModel):
-    job_id: str
-    job_type: str
-    payload: dict
-    attempts: int
-    max_attempts: int
-    last_error: str | None
-    failed_at: str | None
-
-
-class ReplayedJobResponse(BaseModel):
-    job_id: str
-    job_type: str
-    payload: dict
-    attempts: int
-    max_attempts: int
-    queued: bool
 
 
 class CustomerRow(BaseModel):

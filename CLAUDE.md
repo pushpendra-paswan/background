@@ -12,7 +12,7 @@ An API accepts a CSV file of customer records. A background worker then:
 4. Generates a report of invalid records.
 5. Sends an email when processing finishes.
 
-The queue is **built from scratch on Redis**. The goal is to learn how job systems work (claiming, acknowledgement, retries, dead letter queue, crash recovery), so the queue itself is the main thing being learned.
+Jobs run as **Celery tasks**, with Redis as the broker. (The project started with a queue hand-built on Redis to learn how job systems work. Milestone 7.1 replaced it with Celery.)
 
 ## Tech Stack
 
@@ -21,7 +21,8 @@ The queue is **built from scratch on Redis**. The goal is to learn how job syste
 - Pydantic v2 (row validation and API schemas)
 - PostgreSQL (customers and job tracking)
 - SQLAlchemy 2.0 (synchronous) + Alembic (migrations)
-- Redis (the job queue), using the `redis` Python client
+- Celery (`celery[redis]==5.6.3`) as the job queue, with Redis as the broker (no result backend)
+- The `redis` Python client, for queue sizes in `/stats` and for the test scripts
 - Python stdlib `csv` for reading and writing CSV (no pandas)
 - `smtplib` + Mailpit (local fake SMTP server with a web inbox)
 - Local disk for uploaded files and error reports
@@ -31,7 +32,8 @@ The queue is **built from scratch on Redis**. The goal is to learn how job syste
 
 ## Do NOT use
 
-- Celery, RQ, Dramatiq, Arq or any job/queue library. The queue is hand-built.
+- RQ, Dramatiq, Arq or any other job/queue library besides Celery
+- RabbitMQ, Flower, Celery Beat, a Celery result backend, Celery canvas (chain/group/chord)
 - pandas
 - S3 or any object storage
 - A frontend. This is an API-only project.
@@ -74,10 +76,10 @@ Keep the code simple and plain, the way a beginner would read and follow it.
 │   ├── logging_config.py  # JSON log formatter, job_context, setup_logging
 │   ├── models.py          # SQLAlchemy models
 │   ├── schemas.py         # Pydantic schemas
-│   ├── routes/            # API endpoints (imports.py, admin.py: /stats and /dead-jobs)
+│   ├── celery_app.py      # Celery app, ImportTask failure hooks, logging signals
+│   ├── routes/            # API endpoints (imports.py, admin.py: /stats, retry, resend-email)
 │   ├── services/          # business logic used by routes
-│   ├── queue/             # Redis queue: enqueue, worker loop, handler registry
-│   └── handlers/          # job handlers (process_csv, send_email)
+│   └── handlers/          # Celery tasks (process_csv, send_email, test_handlers)
 ├── scripts/               # test CSV generator and similar
 ├── uploads/               # uploaded CSV files
 ├── reports/               # generated error report CSVs
@@ -98,15 +100,18 @@ Treat this as a starting layout. Do not add folders or files that no milestone n
 
 - `POST /imports` saves the file, creates the `import_jobs` row, enqueues the job, and returns `202` with the `job_id` immediately. It never processes the file itself.
 - Workers are separate processes from the API.
-- **Safe claiming:** a worker moves a job from the queue list to its own processing list (`processing:<worker_id>`) atomically (`BLMOVE`), and removes it only after the job succeeds.
-- **At-least-once delivery.** A job can run twice, so handlers must be **idempotent**. Customer inserts use `INSERT ... ON CONFLICT (email) DO NOTHING`.
+- **Late acknowledgement:** tasks are acknowledged after they run (`task_acks_late`), so a task whose worker dies is delivered again.
+- **At-least-once delivery.** A task can be delivered more than once, so tasks must be **idempotent**. Customer inserts use `INSERT ... ON CONFLICT (email) DO NOTHING`.
+- **One run per import:** `process_csv` holds a Postgres advisory lock per import. A duplicate delivery logs `import already running elsewhere` and returns.
+- **Retries** use Celery autoretry with backoff and jitter (`MAX_ATTEMPTS`, `RETRY_BASE_SECONDS`, `RETRY_MAX_SECONDS`). The job timeout is a soft time limit; there is no hard time limit.
+- **The visibility timeout must be more than the job timeout plus 30 seconds** (`VISIBILITY_TIMEOUT_SECONDS` > `JOB_TIMEOUT_SECONDS` + 30). `celery_app.py` refuses to start otherwise.
+- **A crash counts as an attempt** through `import_jobs.attempts` (incremented at every start). Celery does not count a crash as a retry, so `process_csv` gives up when `attempts` is greater than `MAX_ATTEMPTS`.
 - **Stream the CSV** with the `csv` module and process in batches of 1,000 rows. Never load a whole file into memory.
 - **Checkpoint and resume:** `process_csv` saves a checkpoint after every batch (counters, `last_processed_row` and the report size, in the same transaction as the insert) and resumes from it on retry.
 - The email is a **separate job** chained after processing, so an SMTP failure never causes the CSV to be reprocessed.
-- Job handlers are registered in a simple `job_type -> function` dictionary.
-- Workers run in parallel (`docker compose up --scale worker=3`), so handlers must be safe when several of them run at the same time.
+- Workers run in parallel (`docker compose up --scale worker=3`), so tasks must be safe when several of them run at the same time.
 - **Logging:** log only with the `logging` module, never `print`; one JSON object per line; every log line about a job carries `job_id`; keep messages short and put ids and numbers in fields (`extra=`).
-- **Cancel is cooperative:** a running import stops at the next batch boundary, and no code may overwrite a cancel; all status changes made by workers are conditional updates.
+- **Cancel is cooperative:** a running import stops at the next batch boundary, and no code may overwrite a cancel; all status changes made by workers (and by the `ImportTask` retry and failure hooks) are conditional updates or row-locked checks. Cancel never uses Celery revoke or terminate.
 
 ## API Endpoints
 
@@ -117,18 +122,19 @@ Treat this as a starting layout. Do not add folders or files that no milestone n
 | `GET /imports` | List past imports |
 | `GET /imports/{id}/errors` | Download the invalid-records report |
 | `POST /imports/{id}/cancel` | Cancel an import (`200` cancelled, `202` cancelling, `409` already finished) |
-| `GET /stats` | What the system is doing now: queue sizes, workers, imports by status, average durations |
-| `GET /dead-jobs` | List the dead letter queue (newest first, `?limit=`) |
-| `POST /dead-jobs/{job_id}/replay` | Move a dead job back to the queue (`200`, or `404` if it is not dead) |
+| `POST /imports/{id}/retry` | Retry a `failed` import; it resumes from its checkpoint (`202`, `404` unknown, `409` not failed, `503` queue down) |
+| `POST /imports/{id}/resend-email` | Send the email again when `email_status` is `failed` (`202`, `404` unknown, `409` not in a failed state) |
+| `GET /stats` | What the system is doing now: queue sizes (waiting, in flight, active, scheduled), workers, imports by status, failed emails, average durations |
 
 ## Phases
 
 1. **Foundation and Upload API:** Docker Compose, FastAPI, Alembic, tables, upload endpoint, status endpoints.
-2. **Redis Queue and Worker:** enqueue, worker loop, `BLMOVE` claiming and acknowledgement, handler registry.
+2. **Redis Queue and Worker:** enqueue, worker, claiming and acknowledgement (built by hand first, replaced by Celery in phase 7).
 3. **CSV Processing Pipeline:** streaming, validation, bulk insert, error report, counters.
 4. **Email Notification Job:** chained `send_email` job via Mailpit.
-5. **Reliability:** retries with backoff and jitter, dead letter queue, job timeout, checkpoint and resume, heartbeats and reaper, graceful shutdown.
-6. **Scale and Visibility:** multiple workers, progress, cancel, stats endpoint, dead letter queue replay, structured logging.
+5. **Reliability:** retries with backoff and jitter, job timeout, checkpoint and resume, crash recovery, graceful shutdown (hand-built dead letter queue, heartbeats and reaper were replaced in phase 7).
+6. **Scale and Visibility:** multiple workers, progress, cancel, stats endpoint, structured logging.
+7. **Celery migration:** the hand-built queue is replaced by Celery (Milestone 7.1). Failed imports are retried with `POST /imports/{id}/retry`.
 
 ## Workflow
 
@@ -147,6 +153,7 @@ docker compose exec api alembic upgrade head
 docker compose up -d --scale worker=3   # run 3 workers in parallel
 docker compose logs -f worker
 docker compose logs --no-log-prefix worker | grep <import id>   # follow one import through the JSON logs
+docker compose exec worker celery -A app.celery_app inspect ping   # which workers answer
 pytest
 ```
 

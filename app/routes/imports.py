@@ -6,13 +6,14 @@ import redis
 from email_validator import EmailNotValidError, validate_email
 from fastapi import APIRouter, Depends, Form, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse
+from kombu.exceptions import OperationalError
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
+from app.handlers.process_csv import process_csv
 from app.models import ImportJob
-from app.queue.redis_queue import enqueue
 from app.schemas import ImportJobCreatedResponse, ImportJobResponse
 from app.services.imports import save_upload
 
@@ -54,17 +55,17 @@ def create_import(
     db.add(import_job)
     db.commit()
 
-    # Put a process_csv job on the queue. If Redis is down, mark the import as failed and return 503
+    # Put a process_csv task on the queue. If Redis is down, mark the import as failed and return 503
     try:
-        queue_job_id = enqueue("process_csv", {"import_job_id": str(job_id)})
-    except redis.exceptions.RedisError:
+        queue_job_id = process_csv.delay(str(job_id)).id
+    except (OperationalError, redis.exceptions.RedisError):
         import_job.status = "failed"
         import_job.error_message = "Could not add the job to the queue (Redis is unavailable)"
         import_job.finished_at = datetime.now(timezone.utc)
         db.commit()
         raise HTTPException(status_code=503, detail="Job queue is unavailable, try again later")
 
-    # Log it with both ids: the import id and the queue job id
+    # Log it with both ids: the import id and the Celery task id
     logger.info("import uploaded", extra={"import_job_id": str(job_id), "job_id": queue_job_id})
 
     # Return immediately. The worker does the processing

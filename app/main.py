@@ -8,6 +8,6 @@ setup_logging("api")
 
 app = FastAPI(title="CSV Customer Import")
 
-# Register the /imports endpoints and the admin endpoints (/stats, /dead-jobs)
+# Register the /imports endpoints and the admin endpoints (/stats, retry, resend-email)
 app.include_router(imports.router)
 app.include_router(admin.router)

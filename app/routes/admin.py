@@ -1,30 +1,26 @@
-import json
 import logging
 import uuid
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+import redis
+from fastapi import APIRouter, Depends, HTTPException
+from kombu.exceptions import OperationalError
 from sqlalchemy import extract, func, select, update
 from sqlalchemy.orm import Session
 
+from app.celery_app import celery_app
 from app.config import settings
 from app.database import get_db
+from app.handlers.process_csv import process_csv
+from app.handlers.send_email import send_email
 from app.models import ImportJob
-from app.queue.redis_queue import (
-    DEAD_KEY,
-    DELAYED_KEY,
-    PROCESSING_KEY_PREFIX,
-    QUEUE_KEY,
-    WORKER_KEY_PREFIX,
-    redis_client,
-    replay_dead_job_script,
-)
 from app.schemas import (
     JOB_STATUSES,
-    DeadJobResponse,
     DurationStats,
+    EmailStats,
+    ImportJobResponse,
     ImportStats,
     QueueStats,
-    ReplayedJobResponse,
     StatsResponse,
     WorkerStats,
 )
@@ -33,29 +29,37 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["admin"])
 
+# Used to read the two queue numbers that Celery's inspect cannot give
+redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+
 
 @router.get("/stats", response_model=StatsResponse)
 def get_stats(db: Session = Depends(get_db)) -> StatsResponse:
-    # Queue sizes: the waiting list, the retry set and the dead letter queue
-    waiting_count = redis_client.llen(QUEUE_KEY)
-    delayed_count = redis_client.zcard(DELAYED_KEY)
-    dead_count = redis_client.llen(DEAD_KEY)
+    # Tasks waiting in the queue, and tasks that a worker took but has not acknowledged yet
+    waiting_count = redis_client.llen("celery")
+    in_flight_count = redis_client.hlen("unacked")
 
-    # Jobs being processed: add up the lists of all workers. SCAN is used instead of KEYS because it does not block Redis
-    processing_count = 0
-    for processing_key in redis_client.scan_iter(match=PROCESSING_KEY_PREFIX + "*"):
-        processing_count += redis_client.llen(processing_key)
+    # Ask the workers who is alive. This waits up to 1 second for the answers. No answer means no workers
+    ping_replies = celery_app.control.inspect(timeout=1.0).ping() or {}
+    worker_names = sorted(ping_replies.keys())
 
-    # Workers that are alive: one heartbeat key per worker
-    worker_ids = []
-    for worker_key in redis_client.scan_iter(match=WORKER_KEY_PREFIX + "*"):
-        worker_ids.append(worker_key[len(WORKER_KEY_PREFIX):])
-    worker_ids.sort()
+    # Ask the workers that answered what they are doing. Naming them lets Celery stop waiting as soon as they all answer
+    active_count = 0
+    scheduled_count = 0
+    if len(worker_names) > 0:
+        worker_inspector = celery_app.control.inspect(destination=worker_names, timeout=1.0)
+        for tasks in (worker_inspector.active() or {}).values():
+            active_count += len(tasks)
+        for tasks in (worker_inspector.scheduled() or {}).values():
+            scheduled_count += len(tasks)
 
     # Imports by status, from one GROUP BY query. A status with no imports counts 0
     import_counts = {status: 0 for status in JOB_STATUSES}
     for status, status_count in db.execute(select(ImportJob.status, func.count()).group_by(ImportJob.status)).all():
         import_counts[status] = status_count
+
+    # Emails that could not be sent
+    failed_email_count = db.scalar(select(func.count()).select_from(ImportJob).where(ImportJob.email_status == "failed"))
 
     # Durations of the finished imports, from one query. The average is empty (None) when there are none
     finished_count, average_run, average_total = db.execute(
@@ -72,84 +76,77 @@ def get_stats(db: Session = Depends(get_db)) -> StatsResponse:
 
     # Build the answer
     return StatsResponse(
-        queue=QueueStats(waiting=waiting_count, delayed=delayed_count, processing=processing_count, dead=dead_count),
-        workers=WorkerStats(alive=len(worker_ids), ids=worker_ids),
+        queue=QueueStats(
+            waiting=waiting_count, in_flight=in_flight_count, active=active_count, scheduled=scheduled_count
+        ),
+        workers=WorkerStats(alive=len(worker_names), names=worker_names),
         imports=ImportStats(total=sum(import_counts.values()), by_status=import_counts),
+        emails=EmailStats(failed=failed_email_count),
         durations=DurationStats(
             finished_imports=finished_count, avg_run_seconds=average_run, avg_total_seconds=average_total
         ),
     )
 
 
-@router.get("/dead-jobs", response_model=list[DeadJobResponse])
-def list_dead_jobs(limit: int = Query(100, ge=1, le=1000)) -> list[DeadJobResponse]:
-    # Read the newest dead messages (they are pushed on the left, so index 0 is the newest)
-    dead_jobs = []
-    for message in redis_client.lrange(DEAD_KEY, 0, limit - 1):
-        # A message that is not valid JSON is skipped
-        try:
-            job = json.loads(message)
-        except json.JSONDecodeError:
-            logger.warning("skipping a dead message that is not valid JSON", extra={"message_start": message[:100]})
-            continue
+@router.post("/imports/{job_id}/retry", status_code=202, response_model=ImportJobResponse)
+def retry_import(job_id: uuid.UUID, db: Session = Depends(get_db)) -> ImportJob:
+    # The import must exist
+    if db.get(ImportJob, job_id) is None:
+        raise HTTPException(status_code=404, detail="Import job not found")
 
-        dead_jobs.append(
-            DeadJobResponse(
-                job_id=job["job_id"],
-                job_type=job["job_type"],
-                payload=job["payload"],
-                attempts=job["attempts"],
-                max_attempts=job["max_attempts"],
-                last_error=job.get("last_error"),
-                failed_at=job.get("failed_at"),
-            )
-        )
-    return dead_jobs
+    # Only a failed import can be retried. One conditional UPDATE, so two requests cannot both win.
+    # The checkpoint and the report are kept, so the import resumes where it stopped
+    retried = db.execute(
+        update(ImportJob)
+        .where(ImportJob.id == job_id, ImportJob.status == "failed")
+        .values(status="queued", error_message=None, finished_at=None, attempts=0)
+    )
+    db.commit()
+    if retried.rowcount == 0:
+        raise HTTPException(status_code=409, detail="only failed imports can be retried")
 
-
-@router.post("/dead-jobs/{job_id}/replay", response_model=ReplayedJobResponse)
-def replay_dead_job(job_id: str, db: Session = Depends(get_db)) -> ReplayedJobResponse:
-    # Find the dead message with this job id: read the whole list and compare
-    original_message = None
-    for message in redis_client.lrange(DEAD_KEY, 0, -1):
-        try:
-            job = json.loads(message)
-        except json.JSONDecodeError:
-            continue
-        if job["job_id"] == job_id:
-            original_message = message
-            break
-    if original_message is None:
-        raise HTTPException(status_code=404, detail="dead job not found")
-
-    # Build the new message: same job, attempts back to 0, no error and no failed_at
-    new_job = {
-        "job_id": job["job_id"],
-        "job_type": job["job_type"],
-        "payload": job["payload"],
-        "attempts": 0,
-        "max_attempts": settings.max_attempts,
-    }
-
-    # Move it from "dead" to "queue" in one Lua script. It returns 0 if another request replayed it first
-    moved = replay_dead_job_script(keys=[DEAD_KEY, QUEUE_KEY], args=[original_message, json.dumps(new_job)])
-    if moved != 1:
-        raise HTTPException(status_code=404, detail="dead job not found")
-
-    # A failed import goes back to "queued". One conditional UPDATE, so any other status is left alone.
-    # The checkpoint and the report are still there, so the next attempt resumes from them
-    if new_job["job_type"] == "process_csv":
+    # Put a process_csv task on the queue. If that fails, the import goes back to "failed" and the caller gets 503
+    try:
+        process_csv.delay(str(job_id))
+    except (OperationalError, redis.exceptions.RedisError):
         db.execute(
             update(ImportJob)
-            .where(ImportJob.id == uuid.UUID(new_job["payload"]["import_job_id"]), ImportJob.status == "failed")
-            .values(status="queued", error_message=None, finished_at=None)
+            .where(ImportJob.id == job_id)
+            .values(
+                status="failed",
+                error_message="Could not add the job to the queue (Redis is unavailable)",
+                finished_at=datetime.now(timezone.utc),
+            )
         )
         db.commit()
+        raise HTTPException(status_code=503, detail="Job queue is unavailable, try again later")
 
-    # Log it, with the import id when the job has one
-    log_fields = {"job_id": new_job["job_id"], "job_type": new_job["job_type"]}
-    if "import_job_id" in new_job["payload"]:
-        log_fields["import_job_id"] = new_job["payload"]["import_job_id"]
-    logger.info("dead job replayed", extra=log_fields)
+    logger.info("import retried", extra={"import_job_id": str(job_id)})
+    return db.get(ImportJob, job_id)
 
-    return ReplayedJobResponse(**new_job, queued=True)
+
+@router.post("/imports/{job_id}/resend-email", status_code=202, response_model=ImportJobResponse)
+def resend_email(job_id: uuid.UUID, db: Session = Depends(get_db)) -> ImportJob:
+    # The import must exist
+    if db.get(ImportJob, job_id) is None:
+        raise HTTPException(status_code=404, detail="Import job not found")
+
+    # Only a failed email of a finished import can be sent again. One conditional UPDATE
+    resend = db.execute(
+        update(ImportJob)
+        .where(
+            ImportJob.id == job_id,
+            ImportJob.email_status == "failed",
+            ImportJob.status.in_(["completed", "completed_with_errors"]),
+        )
+        .values(email_status="pending", email_error=None)
+    )
+    db.commit()
+    if resend.rowcount == 0:
+        raise HTTPException(status_code=409, detail="email is not in a failed state")
+
+    # Put a send_email task on the queue
+    send_email.delay(str(job_id))
+
+    logger.info("email resend requested", extra={"import_job_id": str(job_id)})
+    return db.get(ImportJob, job_id)

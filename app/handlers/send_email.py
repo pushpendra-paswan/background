@@ -3,6 +3,7 @@ import smtplib
 import uuid
 from email.message import EmailMessage
 
+from app.celery_app import celery_app
 from app.config import settings
 from app.database import SessionLocal
 from app.models import ImportJob
@@ -10,8 +11,17 @@ from app.models import ImportJob
 logger = logging.getLogger("send_email")
 
 
-def send_email(payload: dict) -> None:
-    import_job_id = uuid.UUID(payload["import_job_id"])
+@celery_app.task(
+    bind=True,
+    name="send_email",
+    autoretry_for=(OSError,),
+    retry_backoff=settings.retry_base_seconds,
+    retry_backoff_max=settings.retry_max_seconds,
+    retry_jitter=True,
+    max_retries=settings.max_attempts - 1,
+)
+def send_email(self, import_job_id: str) -> None:
+    import_job_id = uuid.UUID(import_job_id)
 
     with SessionLocal() as db:
         # Load the import job row
@@ -49,7 +59,7 @@ def send_email(payload: dict) -> None:
             with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as smtp_server:
                 smtp_server.send_message(message)
         except OSError as error:
-            # SMTP errors, refused connections and timeouts are all OSError. Save the error, then re-raise so the worker logs it
+            # SMTP errors, refused connections and timeouts are all OSError. Save the error, then re-raise so Celery retries the task
             import_job.email_status = "failed"
             import_job.email_error = str(error)
             db.commit()
