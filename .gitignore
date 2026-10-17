@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+.pytest_cache/
+
+# Uploaded files and generated reports (keep the folder itself)
+uploads/*
+!uploads/.gitkeep
+reports/*
+!reports/.gitkeep
