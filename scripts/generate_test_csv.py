@@ -29,6 +29,7 @@ parser.add_argument("--rows", type=int, default=10000)
 parser.add_argument("--invalid-percent", type=float, default=10)
 parser.add_argument("--output", default="test_customers.csv")
 parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--email-prefix", default="user")
 args = parser.parse_args()
 
 # The same seed always gives the same file
@@ -55,7 +56,7 @@ with open(args.output, "w", encoding="utf-8", newline="") as output_file:
         # Start with a valid row. The email comes from the row number, so it is unique
         digits = "".join(rng.choice("0123456789") for _ in range(10))
         name = fake.name()
-        email = f"user{row_number}@example.com"
+        email = f"{args.email_prefix}{row_number}@example.com"
         phone = rng.choice([f"+{digits}", f"+1 ({digits[:3]}) {digits[3:6]}-{digits[6:]}", digits])
         date_of_birth = fake.date_of_birth(minimum_age=18, maximum_age=90).isoformat()
         country = rng.choice(ALLOWED_COUNTRY_CODES)
@@ -69,7 +70,7 @@ with open(args.output, "w", encoding="utf-8", newline="") as output_file:
         if kind == "missing name":
             name = ""
         elif kind == "bad email format":
-            email = rng.choice([f"user{row_number}example.com", f"user{row_number}@", "@example.com", "user@@example.com"])
+            email = rng.choice([f"{args.email_prefix}{row_number}example.com", f"{args.email_prefix}{row_number}@", "@example.com", "user@@example.com"])
         elif kind == "bad phone":
             phone = rng.choice(["12345", "abc-def-ghij", "+1234567890123456789", "555-CALL-NOW"])
         elif kind == "bad date of birth":

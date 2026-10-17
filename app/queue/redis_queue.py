@@ -51,6 +51,20 @@ recover_job_script = redis_client.register_script(
     """
 )
 
+# A third Lua script, used by the replay endpoint to move a dead job back to the queue. Same idea as the one above:
+# it removes the original message from "dead" and, only if that removed exactly one item, pushes the new message
+# onto "queue" and returns 1. Otherwise it returns 0. So two simultaneous replays of the same job can never queue it twice
+replay_dead_job_script = redis_client.register_script(
+    """
+    local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
+    if removed == 1 then
+        redis.call('LPUSH', KEYS[2], ARGV[2])
+        return 1
+    end
+    return 0
+    """
+)
+
 
 def enqueue(job_type: str, payload: dict) -> str:
     # Create a new job id

@@ -30,6 +30,8 @@ class ImportJob(Base):
     filename: Mapped[str] = mapped_column(String(255))
     file_path: Mapped[str] = mapped_column(String(500))
     status: Mapped[str] = mapped_column(String(30), server_default="queued")
+    # Number of data rows in the CSV (counted at the start of every attempt, used for the progress percentage)
+    rows_in_file: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_rows: Mapped[int] = mapped_column(Integer, server_default="0")
     valid_rows: Mapped[int] = mapped_column(Integer, server_default="0")
     invalid_rows: Mapped[int] = mapped_column(Integer, server_default="0")

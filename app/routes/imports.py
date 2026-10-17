@@ -1,11 +1,12 @@
+import logging
 import uuid
 from datetime import datetime, timezone
 
 import redis
 from email_validator import EmailNotValidError, validate_email
-from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, Form, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -14,6 +15,8 @@ from app.models import ImportJob
 from app.queue.redis_queue import enqueue
 from app.schemas import ImportJobCreatedResponse, ImportJobResponse
 from app.services.imports import save_upload
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/imports", tags=["imports"])
 
@@ -53,13 +56,16 @@ def create_import(
 
     # Put a process_csv job on the queue. If Redis is down, mark the import as failed and return 503
     try:
-        enqueue("process_csv", {"import_job_id": str(job_id)})
+        queue_job_id = enqueue("process_csv", {"import_job_id": str(job_id)})
     except redis.exceptions.RedisError:
         import_job.status = "failed"
         import_job.error_message = "Could not add the job to the queue (Redis is unavailable)"
         import_job.finished_at = datetime.now(timezone.utc)
         db.commit()
         raise HTTPException(status_code=503, detail="Job queue is unavailable, try again later")
+
+    # Log it with both ids: the import id and the queue job id
+    logger.info("import uploaded", extra={"import_job_id": str(job_id), "job_id": queue_job_id})
 
     # Return immediately. The worker does the processing
     return ImportJobCreatedResponse(job_id=job_id)
@@ -82,6 +88,51 @@ def list_imports(db: Session = Depends(get_db)) -> list[ImportJob]:
     # Return all import jobs, newest first
     query = select(ImportJob).order_by(ImportJob.created_at.desc())
     return list(db.scalars(query).all())
+
+
+@router.post("/{job_id}/cancel", response_model=ImportJobResponse)
+def cancel_import(job_id: uuid.UUID, response: Response, db: Session = Depends(get_db)) -> ImportJob:
+    # Every change is one conditional UPDATE (never "read the status, then write"), so a cancel
+    # cannot race with a worker. Try twice: a worker may change the status between our steps
+    for _ in range(2):
+        # Step 1: queued or retrying: no worker is running it, so it is cancelled at once
+        cancelled_now = db.execute(
+            update(ImportJob)
+            .where(ImportJob.id == job_id, ImportJob.status.in_(["queued", "retrying"]))
+            .values(status="cancelled", finished_at=datetime.now(timezone.utc), error_message="cancelled by user")
+        )
+        db.commit()
+        if cancelled_now.rowcount == 1:
+            logger.info("cancel requested", extra={"import_job_id": str(job_id), "result": "cancelled"})
+            return db.get(ImportJob, job_id)
+
+        # Step 2: running: ask the worker to stop. It stops at the next batch boundary
+        cancelling_now = db.execute(
+            update(ImportJob).where(ImportJob.id == job_id, ImportJob.status == "running").values(status="cancelling")
+        )
+        db.commit()
+        if cancelling_now.rowcount == 1:
+            response.status_code = 202
+            logger.info("cancel requested", extra={"import_job_id": str(job_id), "result": "cancelling"})
+            return db.get(ImportJob, job_id)
+
+        # Step 3: nothing changed, so read the row to see why
+        import_job = db.get(ImportJob, job_id)
+        if import_job is None:
+            raise HTTPException(status_code=404, detail="Import job not found")
+
+        # Already cancelling or cancelled: cancel is idempotent, so this is fine
+        if import_job.status in ("cancelling", "cancelled"):
+            logger.info("cancel requested", extra={"import_job_id": str(job_id), "result": import_job.status})
+            return import_job
+
+        # Already finished: it cannot be cancelled
+        if import_job.status in ("completed", "completed_with_errors", "failed"):
+            logger.info("cancel requested", extra={"import_job_id": str(job_id), "result": import_job.status})
+            raise HTTPException(status_code=409, detail="import already finished")
+
+    # A worker kept changing the status under us. Ask the caller to try again
+    raise HTTPException(status_code=409, detail="import changed while cancelling, try again")
 
 
 @router.get("/{job_id}/errors")

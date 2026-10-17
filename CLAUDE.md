@@ -71,9 +71,10 @@ Keep the code simple and plain, the way a beginner would read and follow it.
 │   ├── main.py            # FastAPI app
 │   ├── config.py          # settings from env vars
 │   ├── database.py        # engine and session
+│   ├── logging_config.py  # JSON log formatter, job_context, setup_logging
 │   ├── models.py          # SQLAlchemy models
 │   ├── schemas.py         # Pydantic schemas
-│   ├── routes/            # API endpoints
+│   ├── routes/            # API endpoints (imports.py, admin.py: /stats and /dead-jobs)
 │   ├── services/          # business logic used by routes
 │   ├── queue/             # Redis queue: enqueue, worker loop, handler registry
 │   └── handlers/          # job handlers (process_csv, send_email)
@@ -89,7 +90,7 @@ Treat this as a starting layout. Do not add folders or files that no milestone n
 
 - **customers**: id, name, email (unique), phone, date_of_birth, country, created_at
 - **import_jobs**: id, filename, file_path, status, total_rows, valid_rows, invalid_rows, last_processed_row, error_report_path, attempts, error_message, created_at, started_at, finished_at
-- **Job statuses:** `queued`, `running`, `retrying`, `completed`, `completed_with_errors`, `failed`
+- **Job statuses:** `queued`, `running`, `retrying`, `cancelling`, `cancelled`, `completed`, `completed_with_errors`, `failed`
 - Use UUID primary keys.
 - **Invalid rows are not job failures.** A job fails only for system problems (corrupt file, database outage, and so on).
 
@@ -103,6 +104,9 @@ Treat this as a starting layout. Do not add folders or files that no milestone n
 - **Checkpoint and resume:** `process_csv` saves a checkpoint after every batch (counters, `last_processed_row` and the report size, in the same transaction as the insert) and resumes from it on retry.
 - The email is a **separate job** chained after processing, so an SMTP failure never causes the CSV to be reprocessed.
 - Job handlers are registered in a simple `job_type -> function` dictionary.
+- Workers run in parallel (`docker compose up --scale worker=3`), so handlers must be safe when several of them run at the same time.
+- **Logging:** log only with the `logging` module, never `print`; one JSON object per line; every log line about a job carries `job_id`; keep messages short and put ids and numbers in fields (`extra=`).
+- **Cancel is cooperative:** a running import stops at the next batch boundary, and no code may overwrite a cancel; all status changes made by workers are conditional updates.
 
 ## API Endpoints
 
@@ -112,6 +116,10 @@ Treat this as a starting layout. Do not add folders or files that no milestone n
 | `GET /imports/{id}` | Status, progress, counts |
 | `GET /imports` | List past imports |
 | `GET /imports/{id}/errors` | Download the invalid-records report |
+| `POST /imports/{id}/cancel` | Cancel an import (`200` cancelled, `202` cancelling, `409` already finished) |
+| `GET /stats` | What the system is doing now: queue sizes, workers, imports by status, average durations |
+| `GET /dead-jobs` | List the dead letter queue (newest first, `?limit=`) |
+| `POST /dead-jobs/{job_id}/replay` | Move a dead job back to the queue (`200`, or `404` if it is not dead) |
 
 ## Phases
 
@@ -136,7 +144,9 @@ Treat this as a starting layout. Do not add folders or files that no milestone n
 ```
 docker compose up --build        # run everything
 docker compose exec api alembic upgrade head
+docker compose up -d --scale worker=3   # run 3 workers in parallel
 docker compose logs -f worker
+docker compose logs --no-log-prefix worker | grep <import id>   # follow one import through the JSON logs
 pytest
 ```
 

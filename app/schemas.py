@@ -3,13 +3,25 @@ import uuid
 from datetime import date, datetime, timedelta
 
 from email_validator import EmailNotValidError, validate_email
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 # Country codes a customer row is allowed to use
 ALLOWED_COUNTRY_CODES = [
     "IN", "US", "GB", "CA", "AU", "DE", "FR", "ES", "IT", "NL",
     "SG", "AE", "JP", "CN", "BR", "MX", "ZA", "SE", "CH", "NZ",
 ]
+
+# Every status an import can have
+JOB_STATUSES = (
+    "queued",
+    "running",
+    "retrying",
+    "cancelling",
+    "cancelled",
+    "completed",
+    "completed_with_errors",
+    "failed",
+)
 
 
 class ImportJobCreatedResponse(BaseModel):
@@ -23,6 +35,7 @@ class ImportJobResponse(BaseModel):
     id: uuid.UUID
     filename: str
     status: str
+    rows_in_file: int | None
     total_rows: int
     valid_rows: int
     invalid_rows: int
@@ -32,6 +45,71 @@ class ImportJobResponse(BaseModel):
     finished_at: datetime | None
     notify_email: str | None
     email_status: str
+
+    @computed_field
+    @property
+    def progress_percent(self) -> float | None:
+        # Not counted yet
+        if self.rows_in_file is None:
+            return None
+
+        # A finished import is always 100, and so is an empty file
+        if self.status in ("completed", "completed_with_errors"):
+            return 100.0
+        if self.rows_in_file == 0:
+            return 100.0
+
+        # Otherwise: rows processed so far out of the rows in the file
+        return round(min(100, self.total_rows * 100 / self.rows_in_file), 1)
+
+
+class QueueStats(BaseModel):
+    waiting: int
+    delayed: int
+    processing: int
+    dead: int
+
+
+class WorkerStats(BaseModel):
+    alive: int
+    ids: list[str]
+
+
+class ImportStats(BaseModel):
+    total: int
+    by_status: dict[str, int]
+
+
+class DurationStats(BaseModel):
+    finished_imports: int
+    avg_run_seconds: float | None
+    avg_total_seconds: float | None
+
+
+class StatsResponse(BaseModel):
+    queue: QueueStats
+    workers: WorkerStats
+    imports: ImportStats
+    durations: DurationStats
+
+
+class DeadJobResponse(BaseModel):
+    job_id: str
+    job_type: str
+    payload: dict
+    attempts: int
+    max_attempts: int
+    last_error: str | None
+    failed_at: str | None
+
+
+class ReplayedJobResponse(BaseModel):
+    job_id: str
+    job_type: str
+    payload: dict
+    attempts: int
+    max_attempts: int
+    queued: bool
 
 
 class CustomerRow(BaseModel):

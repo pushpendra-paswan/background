@@ -5,7 +5,7 @@ class Settings(BaseSettings):
     # Read from environment variables (DATABASE_URL, REDIS_URL, UPLOAD_FOLDER, MAX_UPLOAD_SIZE_MB,
     # SMTP_HOST, SMTP_PORT, SMTP_FROM, DEFAULT_NOTIFY_EMAIL, APP_BASE_URL,
     # MAX_ATTEMPTS, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS,
-    # HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_TTL_SECONDS, REAPER_INTERVAL_SECONDS, JOB_TIMEOUT_SECONDS)
+    # HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_TTL_SECONDS, REAPER_INTERVAL_SECONDS, JOB_TIMEOUT_SECONDS, LOG_LEVEL)
     database_url: str
     redis_url: str
     upload_folder: str = "uploads"
@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     heartbeat_ttl_seconds: int = 15
     reaper_interval_seconds: int = 5
     job_timeout_seconds: int = 600
+    log_level: str = "INFO"
 
 
 settings = Settings()
